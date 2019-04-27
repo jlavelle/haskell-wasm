@@ -8,7 +8,7 @@ module Language.Wasm.Validate (
     validate,
     isValid,
     ValidModule,
-    getModule
+    getModule,
 ) where
 
 import Language.Wasm.Structure
@@ -50,17 +50,24 @@ data ValidationError =
     | GlobalIsImmutable
     deriving (Show, Eq)
 
-type ValidationResult = Either ValidationError ()
+data ValidationResult = Invalid ValidationError | Valid
+
+instance Semigroup ValidationResult where
+  (<>) = mappend
 
 instance Monoid ValidationResult where
-    mempty = Right ()
-    mappend (Right ()) vr = vr
-    mappend vr (Right ()) = vr
+    mempty = Valid
+    mappend Valid vr = vr
+    mappend vr Valid = vr
     mappend vr _ = vr
 
+toEither :: ValidationResult -> Either ValidationError ()
+toEither (Invalid e) = Left e
+toEither Valid = Right ()
+
 isValid :: ValidationResult -> Bool
-isValid (Right ()) = True
-isValid (Left reason) = Debug.trace ("Module mismatched with reason " ++ show reason) $ False
+isValid Valid = True
+isValid (Invalid reason) = Debug.trace ("Module mismatched with reason " ++ show reason) $ False
 
 type Validator = Module -> ValidationResult
 
@@ -141,6 +148,9 @@ freshVar = return Var
 runChecker :: Ctx -> Checker a -> Either ValidationError a
 runChecker ctx = runExcept . flip runReaderT ctx
 
+runCheckerV :: Ctx -> Checker ValidationResult -> ValidationResult
+runCheckerV ctx = either Invalid id . runChecker ctx
+
 (!?) :: [a] -> Natural -> Maybe a
 (!?) (x:_) 0 = Just x
 (!?) (_:rest) n = rest !? (n - 1)
@@ -159,7 +169,7 @@ asType (Const v) = Val v
 asType (Mut v) = Val v
 
 shouldBeMut :: GlobalType -> Checker ()
-shouldBeMut (Mut _) = return ()
+shouldBeMut (Mut _) = pure ()
 shouldBeMut (Const v) = throwError GlobalIsImmutable
 
 getLabel :: LabelIndex -> Checker (Maybe ValueType)
@@ -173,13 +183,13 @@ withLabel :: [ValueType] -> Checker a -> Checker a
 withLabel result = withReaderT (\ctx -> ctx { labels = safeHead result : labels ctx })
 
 isMemArgValid :: Int -> MemArg -> Checker ()
-isMemArgValid sizeInBytes MemArg { align } = if 2 ^ align <= sizeInBytes then return () else throwError AlignmentOverflow
+isMemArgValid sizeInBytes MemArg { align } = if 2 ^ align <= sizeInBytes then pure () else throwError AlignmentOverflow
 
 checkMemoryInstr :: Int -> MemArg -> Checker ()
 checkMemoryInstr size memarg = do
     isMemArgValid size memarg
     Ctx { mems } <- ask 
-    if length mems < 1 then throwError MemoryIndexOutOfRange else return ()
+    if length mems < 1 then throwError MemoryIndexOutOfRange else pure ()
 
 getInstrType :: Instruction Natural -> Checker Arrow
 getInstrType Unreachable = return $ Any ==> Any
@@ -402,7 +412,7 @@ getExpressionType = fmap ([] `Arrow`) . foldM go []
         matchStack _ _ _ = error "inconsistent checker state"
 
 isConstExpression :: Expression -> Checker ()
-isConstExpression [] = return ()
+isConstExpression [] = pure ()
 isConstExpression ((I32Const _):rest) = isConstExpression rest
 isConstExpression ((I64Const _):rest) = isConstExpression rest
 isConstExpression ((F32Const _):rest) = isConstExpression rest
@@ -411,7 +421,7 @@ isConstExpression ((GetGlobal idx):rest) = do
     Ctx {globals, importedGlobals} <- ask
     if importedGlobals <= idx
         then throwError GlobalIndexOutOfRange
-        else return ()
+        else pure ()
     case globals !! fromIntegral idx of
         Const _ -> isConstExpression rest
         Mut _ -> throwError InvalidConstantExpr
@@ -457,15 +467,16 @@ isFunctionValid Function {funcType, localTypes = locals, body} mod@Module {types
     then
         let FuncType params results = types !! fromIntegral funcType in
         if length results > 1
-        then Left InvalidResultArity
-        else do
-            let r = safeHead results
-            let ctx = ctxFromModule (params ++ locals) [r] r mod
-            arr <- runChecker ctx $ getExpressionType body
-            if isArrowMatch arr (empty ==> results)
-            then return ()
-            else Left $ TypeMismatch arr (empty ==> results)
-    else Left TypeIndexOutOfRange
+        then Invalid InvalidResultArity
+        else
+            let r = safeHead results in
+            let ctx = ctxFromModule (params ++ locals) [r] r mod in
+            runCheckerV ctx $ do
+              arr <- getExpressionType body
+              if isArrowMatch arr (empty ==> results)
+              then pure Valid
+              else throwError $ TypeMismatch arr (empty ==> results)
+    else Invalid TypeIndexOutOfRange
 
 functionsShouldBeValid :: Validator
 functionsShouldBeValid mod@Module {functions} =
@@ -478,28 +489,28 @@ tablesShouldBeValid Module { imports, tables } =
     let res' = foldl' (\r (Table t) -> r <> isValidTableType t) res tables in
     if length tableImports + length tables <= 1
         then res'
-        else Left MoreThanOneTable
+        else Invalid MoreThanOneTable
     where
         isValidTableType :: TableType -> ValidationResult
         isValidTableType (TableType (Limit min max) _) =
             if min <= fromMaybe min max
-            then return ()
-            else Left InvalidTableType
+            then Valid
+            else Invalid InvalidTableType
 
 memoryShouldBeValid :: Validator
 memoryShouldBeValid Module { imports, mems } =
     let memImports = filter isMemImport imports in
-    let res = foldMap (\Import { desc = ImportMemory l } -> isValidLimit l) memImports in
-    let res' = foldl' (\r (Memory l) -> r <> isValidLimit l) res mems in
+    let importsValid = foldMap (\Import { desc = ImportMemory l } -> isValidLimit l) memImports in
+    let memsValid = foldMap (\(Memory l) -> isValidLimit l) mems in
     if length memImports + length mems <= 1
-        then res'
-        else Left MoreThanOneMemory
-    where
-        isValidLimit :: Limit -> ValidationResult
-        isValidLimit (Limit min max) =
-            let minMax = if min <= fromMaybe min max then return () else Left MinMoreThanMaxInMemoryLimit in
-            let maxLim = if fromMaybe min max <= 65536 then return () else Left MemoryLimitExceeded in
-            minMax <> maxLim
+        then importsValid <> memsValid
+        else Invalid MoreThanOneMemory
+
+isValidLimit :: Limit -> ValidationResult
+isValidLimit (Limit min max) =
+  let minMax = if min <= fromMaybe min max then Valid else Invalid MinMoreThanMaxInMemoryLimit in
+  let maxLim = if fromMaybe min max <= 65536 then Valid else Invalid MemoryLimitExceeded in
+  minMax <> maxLim
 
 globalsShouldBeValid :: Validator
 globalsShouldBeValid m@Module { imports, globals } =
@@ -511,11 +522,11 @@ globalsShouldBeValid m@Module { imports, globals } =
         getGlobalType (Mut vt) = vt
 
         isGlobalValid :: Ctx -> Global -> ValidationResult
-        isGlobalValid ctx (Global gt init) = runChecker ctx $ do
+        isGlobalValid ctx (Global gt init) = runCheckerV ctx $ do
             isConstExpression init
             t <- getExpressionType init
             let expected = empty ==> getGlobalType gt
-            if isArrowMatch expected t then return () else throwError $ TypeMismatch t expected
+            if isArrowMatch expected t then pure Valid else throwError $ TypeMismatch t expected
 
 elemsShouldBeValid :: Validator
 elemsShouldBeValid m@Module { elems, functions, tables, imports } =
@@ -524,22 +535,22 @@ elemsShouldBeValid m@Module { elems, functions, tables, imports } =
     where
         isElemValid :: Ctx -> ElemSegment -> ValidationResult
         isElemValid ctx (ElemSegment tableIdx offset funs) =
-            let check = runChecker ctx $ do
+            let check = runCheckerV ctx $ do
                     isConstExpression offset
                     t <- getExpressionType offset
                     if isArrowMatch (empty ==> I32) t
-                    then return ()
-                    else throwError $ TypeMismatch t (empty ==> I32) 
+                    then pure Valid
+                    else throwError $ TypeMismatch t (empty ==> I32)
             in
             let tableImports = filter isTableImport imports in
             let isTableIndexValid =
                     if tableIdx < (fromIntegral $ length tableImports + length tables)
-                    then return ()
-                    else Left TableIndexOutOfRange
+                    then Valid
+                    else Invalid TableIndexOutOfRange
             in
             let funImports = filter isFuncImport imports in
             let funsLength = fromIntegral $ length functions + length funImports in
-            let isFunsValid = foldMap (\i -> if i < funsLength then return () else Left FunctionIndexOutOfRange) funs in
+            let isFunsValid = foldMap (\i -> if i < funsLength then Valid else Invalid FunctionIndexOutOfRange) funs in
             check <> isFunsValid <> isTableIndexValid
 
 datasShouldBeValid :: Validator
@@ -549,26 +560,26 @@ datasShouldBeValid m@Module { datas, mems, imports } =
     where
         isDataValid :: Ctx -> DataSegment -> ValidationResult
         isDataValid ctx (DataSegment memIdx offset _) =
-            let check = runChecker ctx $ do
+            let check = runCheckerV ctx $ do
                     isConstExpression offset
                     t <- getExpressionType offset
                     if isArrowMatch (empty ==> I32) t
-                    then return ()
-                    else throwError $ TypeMismatch t (empty ==> I32) 
+                    then pure Valid
+                    else throwError $ TypeMismatch t (empty ==> I32)
             in
             let memImports = filter isMemImport imports in
             if memIdx < (fromIntegral $ length memImports + length mems)
             then check
-            else Left MemoryIndexOutOfRange
+            else Invalid MemoryIndexOutOfRange
 
 startShouldBeValid :: Validator
-startShouldBeValid Module { start = Nothing } = return ()
+startShouldBeValid Module { start = Nothing } = Valid
 startShouldBeValid m@Module { start = Just (StartFunction idx) } =
     let types = getFuncTypes m in
     let i = fromIntegral idx in
     if length types > i
-    then if FuncType [] [] == types !! i then return () else Left InvalidStartFunctionType
-    else Left FunctionIndexOutOfRange
+    then if FuncType [] [] == types !! i then Valid else Invalid InvalidStartFunctionType
+    else Invalid FunctionIndexOutOfRange
 
 exportsShouldBeValid :: Validator
 exportsShouldBeValid Module { exports, imports, functions, mems, tables, globals } =
@@ -581,29 +592,29 @@ exportsShouldBeValid Module { exports, imports, functions, mems, tables, globals
 
         isExportValid :: Export -> ValidationResult
         isExportValid (Export _ (ExportFunc funIdx)) =
-            if fromIntegral funIdx < length funcImports + length functions then return () else Left FunctionIndexOutOfRange
+            if fromIntegral funIdx < length funcImports + length functions then Valid else Invalid FunctionIndexOutOfRange
         isExportValid (Export _ (ExportTable tableIdx)) =
-            if fromIntegral tableIdx < length tableImports + length tables then return () else Left TableIndexOutOfRange
+            if fromIntegral tableIdx < length tableImports + length tables then Valid else Invalid TableIndexOutOfRange
         isExportValid (Export _ (ExportMemory memIdx)) =
-            if fromIntegral memIdx < length memImports + length mems then return () else Left MemoryIndexOutOfRange
+            if fromIntegral memIdx < length memImports + length mems then Valid else Invalid MemoryIndexOutOfRange
         isExportValid (Export _ (ExportGlobal globalIdx)) =
             if fromIntegral globalIdx < length globalImports + length globals
             then (
                 if fromIntegral globalIdx >= length globalImports
                 then (
                     case globals !! (fromIntegral globalIdx - length globalImports) of
-                        (Global (Mut _) _) -> Left ExportedGlobalIsNotConst
-                        _ -> return ()
+                        (Global (Mut _) _) -> Invalid ExportedGlobalIsNotConst
+                        _ -> Valid
                 )
-                else return ()
+                else Valid
             )
-            else Left GlobalIndexOutOfRange
+            else Invalid GlobalIndexOutOfRange
 
         areExportNamesUnique :: ValidationResult
         areExportNamesUnique =
             case foldl' go (Set.empty, []) exports of
-                (_, []) -> return ()
-                (_, dup) -> Left $ DuplicatedExportNames dup
+                (_, []) -> Valid
+                (_, dup) -> Invalid $ DuplicatedExportNames dup
             where
                 go :: (Set.Set TL.Text, [String]) -> Export -> (Set.Set TL.Text, [String])
                 go (set, dup) (Export name _) =
@@ -618,23 +629,23 @@ importsShouldBeValid Module { imports, types } =
         isImportValid :: Import -> ValidationResult
         isImportValid (Import _ _ (ImportFunc typeIdx)) =
             if fromIntegral typeIdx < length types
-            then return ()
-            else Left TypeIndexOutOfRange
-        isImportValid (Import _ _ (ImportTable _)) = return () -- checked in tables section
-        isImportValid (Import _ _ (ImportMemory _)) = return () -- checked in mems section
-        isImportValid (Import _ _ (ImportGlobal (Const _))) = return ()
-        isImportValid (Import _ _ (ImportGlobal (Mut _))) = Left ImportedGlobalIsNotConst
+            then Valid
+            else Invalid TypeIndexOutOfRange
+        isImportValid (Import _ _ (ImportTable _)) = Valid -- checked in tables section
+        isImportValid (Import _ _ (ImportMemory _)) = Valid -- checked in mems section
+        isImportValid (Import _ _ (ImportGlobal (Const _))) = Valid
+        isImportValid (Import _ _ (ImportGlobal (Mut _))) = Invalid ImportedGlobalIsNotConst
 
 typesShouldBeValid :: Validator
 typesShouldBeValid Module { types } = foldMap isTypeValid types
     where
         isTypeValid :: FuncType -> ValidationResult
-        isTypeValid FuncType { results } = if length results <= 1 then return () else Left InvalidResultArity
+        isTypeValid FuncType { results } = if length results <= 1 then Valid else Invalid InvalidResultArity
 
 newtype ValidModule = ValidModule { getModule :: Module } deriving (Show, Eq)
 
 validate :: Module -> Either ValidationError ValidModule
-validate mod = const (ValidModule mod) <$> foldMap ($ mod) validators
+validate mod = const (ValidModule mod) <$> toEither (foldMap ($ mod) validators)
     where
         validators :: [Validator]
         validators = [
