@@ -4,7 +4,7 @@ cabal-version: 1.12
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 5824f3a15a03f894f54e55c408c820c174a8078d69e25cdfbdff52796e9856f7
+-- hash: 3184bdef9da01f50fbab0e89aa752dc905e86cb447377308364dc877acce3cec
 
 name:           wasm
 version:        2.0.0
@@ -68,6 +68,21 @@ executable wasm
     , base64-bytestring
     , bytestring
     , optparse-applicative
+    , wasm
+  default-language: Haskell2010
+
+executable wasm-examples
+  main-is: Main.hs
+  other-modules:
+      Paths_wasm
+  hs-source-dirs:
+      examples
+  ghc-options: -Wall -Wcompat -Wincomplete-record-updates -Wincomplete-uni-patterns -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
+  build-tools:
+      alex >=3.1.3
+    , happy >=1.9.4
+  build-depends:
+      base >=4.6 && <5.0
     , wasm
   default-language: Haskell2010
 
